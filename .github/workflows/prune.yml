@@ -1,8 +1,8 @@
 name: Prune GHCR
 
 on:
-  schedule:
-    - cron: "0 0 * * *"
+  push:
+  pull_request:
 
 permissions:
   contents: write
