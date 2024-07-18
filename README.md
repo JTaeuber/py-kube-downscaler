@@ -3,8 +3,8 @@ Python Kubernetes Downscaler
 
 This is a fork of [hjacobs/kube-downscaler](https://codeberg.org/hjacobs/kube-downscaler) which is no longer maintained.
 
-Scale down / "pause" Kubernetes workload (`Deployments`, `StatefulSets`, and/or
-`HorizontalPodAutoscalers` and `CronJobs` too !) during non-work hours.
+Scale down / "pause" Kubernetes workload (`Deployments`, `StatefulSets`,
+`HorizontalPodAutoscalers`, `DaemonSets`, `CronJobs`, `Jobs`, `PodDisruptionBudgets`, `Argo Rollouts` and `Keda ScaledObjects`  too !) during non-work hours.
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
@@ -22,9 +22,15 @@ Scale down / "pause" Kubernetes workload (`Deployments`, `StatefulSets`, and/or
     - [Notes](#notes)
   - [Configuration](#configuration)
     - [Uptime / downtime spec](#uptime--downtime-spec)
-    - [Alternative logic, based on periods](#alternative-logic-based-on-periods)
+    - [Alternative Logic, Based on Periods](#alternative-logic-based-on-periods)
     - [Command Line Options](#command-line-options)
+    - [Scaling Jobs: Overview](#scaling-jobs-overview)
+    - [Scaling Jobs Natively](#scaling-jobs-natively)
+    - [Scaling Jobs With Admission Controller](#scaling-jobs-with-admission-controller)
+    - [Scaling Daemonsets](#scaling-daemonset)
+    - [Matching Labels Argument](#matching-labels-argument)
     - [Namespace Defaults](#namespace-defaults)
+  - [Migrate From Codeberg](#migrate-from-codeberg)
   - [Contributing](#contributing)
   - [License](#license)
 
@@ -152,7 +158,7 @@ nginx deployment, i.e.
   will eventually log something like:
 
 ```
-    INFO: Scaling down Deployment default/nginx from 1 to 0 replicas (uptime: Mon-Fri 09:00-17:00 America/Buenos_Aires, downtime: never)
+INFO: Scaling down Deployment default/nginx from 1 to 0 replicas (uptime: Mon-Fri 09:00-17:00 America/Buenos_Aires, downtime: never)
 ```
 
 Note that in cases where a `HorizontalPodAutoscaler` (HPA) is used along
@@ -215,7 +221,7 @@ Each time specification can be in one of two formats:
     `<YYYY>-<MM>-<DD>T<HH>:<MM>:<SS>[+-]<TZHH>:<TZMM>`.
 
 
-### Alternative logic, based on periods
+### Alternative Logic, Based on Periods
 
 Instead of strict uptimes or downtimes, you can chose time periods for
 upscaling or downscaling. The time definitions are the same. In this
@@ -266,8 +272,8 @@ Available command line options:
 
 `--include-resources`
 
-:   Downscale resources of this kind as comma separated list.
-    \[deployments, statefulsets, stacks, horizontalpodautoscalers, cronjobs, daemonsets, rollouts, scaledobjects, jobs\]
+:   Downscale resources of this kind as comma separated list. Available resources are:
+    `[deployments, statefulsets, stacks, horizontalpodautoscalers, cronjobs, daemonsets, poddisruptionbudgets, rollouts, scaledobjects, jobs]`
     (default: deployments)
 
 `--grace-period`
@@ -345,23 +351,70 @@ Available command line options:
 :   Optional: admission controller used by the kube-downscaler to downscale and upscale
     jobs. Required only if "jobs" are specified inside "--include-resources" arg. 
     Supported Admission Controllers are
-    \[gatekeeper, kyverno*\]
+    \[gatekeeper, kyverno*\] 
 
-    *Make sure to read the dedicated section below to understand how to use the
-    --admission-controller feature correctly
+> [!IMPORTANT] 
+> Make sure to read the dedicated section below to understand how to use the
+> `--admission-controller` feature correctly
 
-### Scaling Jobs
+### Scaling Jobs: Overview
 
-Before scaling jobs make sure the Admission Controller of your choice is correctly installed inside the cluster. 
-Kube-Downscaler performs some health checks that are displayed inside logs when the `--debug` arg is present. 
-If you are using Gatekeeper, Kube-Downscaler will install a new Custom Resource Definition
-called `kubedownscalerjobsconstraint`
+Kube Downscaler offers two possibilities for downscaling Jobs:
 
-**When using this feature you need to exclude Kyverno or Gatekeeper resources from downscaling otherwise 
-the admission controller pods won't be able to donwscale jobs.** 
-You can use `EXCLUDE_NAMESPACES` environment variable or `--exclude-namespaces` arg to exclude `"kyverno"` or `"gatekeeper-system"` namespaces. 
-To have a more fine-grained control you can use `EXCLUDE_DEPLOYMENTS` environment variable
+1) Downscaling Jobs Natively: Kube Downscaler will downscale Jobs by modifying the spec.suspend parameter 
+within the job's yaml file. The spec.suspend parameter will be set to True and the pods created by the Job 
+will be automatically deleted.
+
+2) Downscaling Jobs With Admission Controllers: Kube Downscaler will block the creation of all new Jobs using
+Admission Policies created with an Admission Controller (Kyverno or Gatekeeper, depending on the user's choice)
+
+In both cases, all Jobs created by CronJob will not be modified unless the user specifies via the
+`--include-resources` argument that they want to turn off both Jobs and CronJobs
+
+**How To Choose The Correct Mode:**
+
+1) The first mode is recommended when the Jobs created within the Cluster are few and sporadic
+
+2) The second mode is recommended when there are many Jobs created within the Cluster and they are created at very frequent intervals.
+
+it's important to note the following:
+
+The second mode is specifically designed to avoid frequent node provisioning. This is particularly relevant when KubeDownscaler
+might turn off jobs shortly after they've triggered node provisioning. If jobs trigger node provisioning but are then
+scaled down or stopped by KubeDownscaler within 30 to 60 seconds, the Cluster Autoscaler is basically doing an unnecessary 
+provisioning action because the new nodes will be scaled down shortly after as well. Frequently provisioning nodes only to
+have them become unnecessary shortly thereafter is an operation that should be minimized, as it is inefficient. 
+
+### Scaling Jobs Natively
+
+To scale down jobs natively, you only need to specify `jobs` inside the `--include-resource` argument of the Deployment
+
+### Scaling Jobs With Admission Controller
+
+Before scaling jobs with an Admission Controller make sure the Admission Controller of your choice is correctly installed inside the
+cluster. 
+At startup, Kube-Downscaler will always perform some health checks for the Admission Controller of your choiche that are 
+displayed inside logs when the argument `--debug` arg is present inside the main Deployment. 
+
+**<u>Important</u>: In order to use this feature you will need to exclude Kyverno or Gatekeeper resources from downscaling otherwise 
+the admission controller pods won't be able to block jobs.** You can use `EXCLUDE_NAMESPACES` environment variable or `--exclude-namespaces`
+arg to exclude `"kyverno"` or `"gatekeeper-system"` namespaces. 
+Alternatively `EXCLUDE_DEPLOYMENTS` environment variable
 or `--exclude-deployments` arg to exclude only certain resources inside `"kyverno"` or `"gatekeeper-system"` namespaces
+
+The workflow for blocking jobs is different if you use Gatekeeper or Kyverno, both are described below
+
+**Blocking Jobs: Gatekeeper Workflow**
+
+1) Kube-Downscaler will install a new Custom Resource Definition
+called `kubedownscalerjobsconstraint`.
+2) Kube-Downscaler will create a Constraint called "KubeDownscalerJobsConstraint" for each namespace that is not excluded
+
+**Blocking Jobs: Kyverno Workflow**
+
+1) Kube-Downscaler will create a Policy for each namespace that is not excluded
+
+All the statements below are valid for both Kyverno and Gatekeeper, unless specified otherwise
 
 **<u>Important</u>:** Jobs started from CronJobs are excluded by default unless you have included `cronjobs` inside `--include-resources` argument
 
@@ -396,19 +449,18 @@ annotations are not supported if specified directly inside the Job definition du
 on computing days of the week inside the policies. However you can still use 
 these annotations at Namespace level to downscale/upscale Jobs 
 
-
 **Deleting Policies:** if for some reason you want to delete all resources blocking jobs, you can use these commands:
 
 Gatekeeper
 
-``` {.sourceCode .sh}
-kubectl delete constraints -A -l origin=kube-downscaler
+```bash
+$ kubectl delete constraints -A -l origin=kube-downscaler
 ```
 
 Kyverno
 
-``` {.sourceCode .sh}
-kubectl delete policies -A -l origin=kube-downscaler
+```bash
+$ kubectl delete policies -A -l origin=kube-downscaler
 ```
 
 ### Scaling DaemonSet
@@ -504,6 +556,22 @@ The following annotations are supported on the Namespace level:
 -   `downscaler/downtime-replicas`: overwrite the default target
     replicas to scale down to (default: zero)
 
+## Migrate From Codeberg
+
+For all users who come from the Codeberg repository (no longer maintained by the original author) 
+it is possible to migrate to this new version of the kube-downscaler by installing the Helm chart in this way:
+
+```bash
+$ helm install kube-downscaler py-kube-downscaler/py-kube-downscaler --set nameOverride=kube-downscaler --set configMapName=kube-downscaler
+```
+
+or extracting and applying the template manually:
+
+```bash
+$ helm template kube-downscaler py-kube-downscaler/py-kube-downscaler --set nameOverride=kube-downscaler --set configMapName=kube-downscaler
+```
+
+Installing the chart in this way will preserve the old nomenclature already present in your cluster
 
 ## Contributing
 
